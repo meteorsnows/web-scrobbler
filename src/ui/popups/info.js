@@ -19,10 +19,13 @@ require([
 	}
 
 	async function sendMessageToCurrentTab(type, data) {
-		const tab = await Util.getCurrentTab();
-		const tabId = tab.id;
+		const tabId = await sendMessage('REQUEST_ACTIVE_TABID');
 
 		return browser.runtime.sendMessage({ type, data, tabId });
+	}
+
+	async function sendMessage(type, data) {
+		return browser.runtime.sendMessage({ type, data });
 	}
 
 	function onSongLoaded() {

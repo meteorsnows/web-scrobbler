@@ -8,7 +8,7 @@ define((require) => {
 	const Timer = require('object/timer');
 	const Pipeline = require('pipeline/pipeline');
 	const Notifications = require('browser/notifications');
-	const BrowserAction = require('browser/browser-action');
+	const ControllerMode = require('object/controller-mode');
 	const ScrobbleService = require('object/scrobble-service');
 	const ServiceCallResult = require('object/service-call-result');
 	const LocalCacheStorage = require('storage/local-cache');
@@ -34,7 +34,7 @@ define((require) => {
 			this.tabId = tabId;
 			this.connector = connector;
 
-			this.pageAction = new BrowserAction(tabId);
+			this.setMode(ControllerMode.Base);
 			this.playbackTimer = new Timer();
 			this.replayDetectionTimer = new Timer();
 
@@ -60,25 +60,11 @@ define((require) => {
 			this.isEnabled = flag;
 
 			if (flag) {
-				this.pageAction.setSiteSupported();
+				this.setMode(ControllerMode.Base);
 			} else {
 				this.resetState();
-
-				this.pageAction.setSiteDisabled();
+				this.setMode(ControllerMode.Disabled);
 			}
-		}
-
-		/**
-		 * Reset controller state.
-		 */
-		resetState() {
-			this.playbackTimer.reset();
-			this.replayDetectionTimer.reset();
-
-			if (this.currentSong !== null) {
-				Notifications.clearNowPlaying(this.currentSong);
-			}
-			this.currentSong = null;
 		}
 
 		/**
@@ -107,7 +93,7 @@ define((require) => {
 				throw new Error('No song is now playing');
 			}
 
-			this.pageAction.setSongSkipped(this.currentSong);
+			this.setMode(ControllerMode.Skipped);
 
 			this.currentSong.flags.isSkipped = true;
 
@@ -220,7 +206,16 @@ define((require) => {
 			}
 		}
 
+		onModeChanged(/* state */) {
+			// 2
+		}
+
 		/** Internal functions */
+
+		setMode(mode) {
+			this.mode = mode;
+			this.onModeChanged(mode);
+		}
 
 		/**
 		 * Process connector state as new one.
@@ -292,6 +287,19 @@ define((require) => {
 		}
 
 		/**
+		 * Reset controller state.
+		 */
+		resetState() {
+			this.playbackTimer.reset();
+			this.replayDetectionTimer.reset();
+
+			if (this.currentSong !== null) {
+				Notifications.clearNowPlaying(this.currentSong);
+			}
+			this.currentSong = null;
+		}
+
+		/**
 		 * Process song info change.
 		 * @param {Object} song Song instance
 		 * @param {Object} target Target object
@@ -331,7 +339,7 @@ define((require) => {
 		 * Process song using pipeline module.
 		 */
 		processSong() {
-			this.pageAction.setSongLoading(this.currentSong);
+			this.setMode(ControllerMode.Loading);
 			Pipeline.processSong(this.currentSong);
 		}
 
@@ -367,7 +375,7 @@ define((require) => {
 						this.showNowPlayingNotification();
 					}
 				} else {
-					this.pageAction.setSiteSupported();
+					this.setMode(ControllerMode.Base);
 				}
 			} else {
 				this.setSongNotRecognized();
@@ -403,6 +411,10 @@ define((require) => {
 				if (!this.currentSong.flags.isMarkedAsPlaying
 					&& this.currentSong.isValid()) {
 					this.setSongNowPlaying();
+				} else if (this.currentSong.flags.isScrobbled) {
+					this.setMode(ControllerMode.Scrobbled);
+				} else {
+					this.setMode(ControllerMode.Playing);
 				}
 			} else {
 				this.playbackTimer.pause();
@@ -499,10 +511,10 @@ define((require) => {
 			const results = await ScrobbleService.sendNowPlaying(this.currentSong);
 			if (isAnyResult(results, ServiceCallResult.OK)) {
 				this.debugLog('Song set as now playing');
-				this.pageAction.setSongRecognized(this.currentSong);
+				this.setMode(ControllerMode.Playing);
 			} else {
 				this.debugLog('Song isn\'t set as now playing');
-				this.pageAction.setError();
+				this.setMode(ControllerMode.Error);
 			}
 
 			this.showNowPlayingNotification();
@@ -512,7 +524,7 @@ define((require) => {
 		 * Notify user that song it not recognized by the extension.
 		 */
 		setSongNotRecognized() {
-			this.pageAction.setSongNotRecognized();
+			this.setMode(ControllerMode.Unknown);
 			Notifications.showSongNotRecognized(() => {
 				Util.openTab(this.tabId);
 			});
@@ -529,25 +541,23 @@ define((require) => {
 				this.debugLog('Scrobbled successfully');
 
 				this.currentSong.flags.isScrobbled = true;
-				this.pageAction.setSongScrobbled(this.currentSong);
+				this.setMode(ControllerMode.Scrobbled);
 
 				this.onSongUpdated(this.currentSong);
 
 				GA.event('core', 'scrobble', this.connector.label);
 			} else if (areAllResults(results, ServiceCallResult.IGNORED)) {
 				this.debugLog('Song is ignored by service');
-				this.pageAction.setSongIgnored(this.currentSong);
+				this.setMode(ControllerMode.Ignored);
 			} else {
 				this.debugLog('Scrobbling failed', 'warn');
-
-				this.pageAction.setError();
+				this.setMode(ControllerMode.Error);
 			}
 		}
 
 		reset() {
 			this.resetState();
-
-			this.pageAction.setSiteSupported();
+			this.setMode(ControllerMode.Base);
 		}
 
 		/**

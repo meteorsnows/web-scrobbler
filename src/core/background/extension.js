@@ -34,7 +34,9 @@ define((require) => {
 	const browser = require('webextension-polyfill');
 	const Controller = require('object/controller');
 	const InjectResult = require('object/inject-result');
+	const BrowserAction = require('browser/browser-action');
 	const Notifications = require('browser/notifications');
+	const ControllerMode = require('object/controller-mode');
 	const BrowserStorage = require('storage/browser-storage');
 	const ScrobbleService = require('object/scrobble-service');
 
@@ -71,6 +73,20 @@ define((require) => {
 
 	const notificationStorage = BrowserStorage.getStorage(BrowserStorage.NOTIFICATIONS);
 
+	const browserAction = new BrowserAction();
+
+	/**
+	 * ID of a recent active tab.
+	 * @type {Number}
+	 */
+	let activeTabId = null;
+
+	/**
+	 * ID of a current tab.
+	 * @type {Number}
+	 */
+	let currentTabId = null;
+
 	/**
 	 * Setup browser event listeners. Called on startup.
 	 */
@@ -94,10 +110,7 @@ define((require) => {
 	}
 
 	async function onCommand(command) {
-		const tab = await Util.getCurrentTab();
-		const tabId = tab.id;
-
-		const ctrl = tabControllers[tabId];
+		const ctrl = tabControllers[activeTabId] || tabControllers[currentTabId];
 		if (!ctrl) {
 			return;
 		}
@@ -106,15 +119,12 @@ define((require) => {
 			case 'toggle-connector':
 				setConnectorState(ctrl, !ctrl.isEnabled);
 				break;
-			case 'disable-connector':
-				ctrl.setEnabled(false);
-				break;
 			case 'love-song':
 			case 'unlove-song': {
 				const isLoved = command === 'love-song';
 
 				await ctrl.toggleLove(isLoved);
-				ctrl.pageAction.setSongLoved(isLoved, ctrl.getCurrentSong());
+				browserAction.setSongLoved(isLoved, ctrl.getCurrentSong());
 				break;
 			}
 		}
@@ -125,17 +135,21 @@ define((require) => {
 	 * @param  {Object} request Message sent by the calling script
 	 */
 	async function onMessage(request) {
-		if (request.type === 'REQUEST_AUTHENTICATE') {
-			const scrobblerLabel = request.scrobbler;
-			const scrobbler = ScrobbleService.getScrobblerByLabel(scrobblerLabel);
+		switch (request.type) {
+			case 'REQUEST_AUTHENTICATE': {
+				const scrobblerLabel = request.scrobbler;
+				const scrobbler = ScrobbleService.getScrobblerByLabel(scrobblerLabel);
 
-			if (scrobbler) {
-				authenticateScrobbler(scrobbler);
+				if (scrobbler) {
+					authenticateScrobbler(scrobbler);
+				}
+
+				return;
 			}
 
-			return;
+			case 'REQUEST_ACTIVE_TABID':
+				return activeTabId;
 		}
-
 
 		const tabId = request.tabId;
 		const ctrl = tabControllers[tabId];
@@ -228,7 +242,19 @@ define((require) => {
 						// Suppress errors
 					}
 				};
+				ctrl.onModeChanged = (mode) => {
+					if (ControllerMode.isActive(mode)) {
+						activeTabId = tabId;
+					}
+
+					if (tabId === activeTabId) {
+						browserAction.update(ctrl);
+					}
+				};
 				tabControllers[tabId] = ctrl;
+				if (shouldUpdateBrowserAction(tabId)) {
+					updateBrowserAction(tabId);
+				}
 
 				browser.tabs.sendMessage(tabId, { type: 'EVENT_READY' });
 
@@ -250,7 +276,14 @@ define((require) => {
 	 * @param  {Object} activeInfo Object contains info about current tab
 	 */
 	function onTabChanged(activeInfo) {
-		updateContextMenu(activeInfo.tabId);
+		const { tabId } = activeInfo;
+		currentTabId = tabId;
+
+		updateContextMenu(tabId);
+		if (shouldUpdateBrowserAction(tabId)) {
+			updateBrowserAction(tabId);
+			activeTabId = tabId;
+		}
 	}
 
 	/**
@@ -259,6 +292,40 @@ define((require) => {
 	 */
 	function onTabRemoved(tabId) {
 		unloadController(tabId);
+
+		if (tabId === currentTabId) {
+			return;
+		}
+
+		const lastActiveTabId = findActiveTabId();
+		if (lastActiveTabId) {
+			const ctrl = tabControllers[lastActiveTabId];
+
+			browserAction.update(ctrl);
+			activeTabId = lastActiveTabId;
+		} else {
+			browserAction.reset();
+		}
+	}
+
+	function findActiveTabId() {
+		const ctrl = tabControllers[currentTabId];
+		if (ctrl && ControllerMode.isActive(ctrl.mode)) {
+			return currentTabId;
+		}
+
+		for (const tabId in tabControllers) {
+			const mode = tabControllers[tabId].mode;
+			if (ControllerMode.isActive(mode)) {
+				return tabId;
+			}
+		}
+
+		if (ctrl) {
+			return currentTabId;
+		}
+
+		return null;
 	}
 
 	/**
@@ -277,33 +344,32 @@ define((require) => {
 	function updateContextMenu(tabId) {
 		browser.contextMenus.removeAll();
 
-		const controller = tabControllers[tabId];
-		if (!controller) {
-			return;
+		if (activeTabId !== tabId) {
+			addContextMenuFor(tabId, tabControllers[activeTabId]);
 		}
-		const connector = controller.getConnector();
-
-		if (controller.isEnabled) {
-			const title1 = browser.i18n.getMessage('menuDisableConnector', connector.label);
-			addContextMenuItem(title1, () => {
-				setConnectorState(controller, false);
-				updateContextMenu(tabId);
-			});
-
-			const title2 = browser.i18n.getMessage('menuDisableUntilTabClosed');
-			addContextMenuItem(title2, () => {
-				controller.setEnabled(false);
-				updateContextMenu(tabId);
-			});
-		} else {
-			const title = browser.i18n.getMessage('menuEnableConnector', connector.label);
-			addContextMenuItem(title, () => {
-				setConnectorState(controller, true);
-				updateContextMenu(tabId);
-			});
-		}
+		addContextMenuFor(tabId, tabControllers[tabId]);
 
 		addContextMenuItem(null, null, 'separator');
+	}
+
+	function addContextMenuFor(tabId, ctrl) {
+		if (!ctrl) {
+			return;
+		}
+
+		const connector = ctrl.getConnector();
+		const labelId = ctrl.isEnabled ? 'menuDisableConnector' : 'menuEnableConnector';
+		const newValue = !ctrl.isEnabled;
+		const itemTitle = browser.i18n.getMessage(labelId, connector.label);
+
+		addContextMenuItem(itemTitle, () => {
+			setConnectorState(ctrl, newValue);
+			updateContextMenu(tabId);
+
+			if (shouldUpdateBrowserAction(tabId)) {
+				updateBrowserAction(tabId);
+			}
+		});
 	}
 
 	/**
@@ -316,6 +382,31 @@ define((require) => {
 		browser.contextMenus.create({
 			title, type, onclick, contexts: ['browser_action'],
 		});
+	}
+
+	function updateBrowserAction(tabId) {
+		const ctrl = tabControllers[tabId];
+		if (ctrl) {
+			browserAction.update(ctrl);
+		} else {
+			browserAction.reset();
+		}
+	}
+
+	function shouldUpdateBrowserAction(tabId) {
+		const activeCtrl = tabControllers[activeTabId];
+		if (activeCtrl && ControllerMode.isActive(activeCtrl.mode)) {
+			return false;
+		}
+
+		const ctrl = tabControllers[tabId];
+		if (ctrl) {
+			if (tabId !== currentTabId && ControllerMode.isInactive(ctrl.mode)) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	/**
@@ -336,16 +427,17 @@ define((require) => {
 	 * Stop and remove controller for given tab ID.
 	 * @param  {Number} tabId Tab ID
 	 */
-	function unloadController(tabId) {
+	async function unloadController(tabId) {
 		const controller = tabControllers[tabId];
-
-		if (controller) {
-			const label = controller.getConnector().label;
-			console.log(`Tab ${tabId}: Remove controller for ${label} connector`);
-
-			controller.finish();
-			delete tabControllers[tabId];
+		if (!controller) {
+			return;
 		}
+
+		const label = controller.getConnector().label;
+		console.log(`Tab ${tabId}: Remove controller for ${label} connector`);
+
+		controller.finish();
+		delete tabControllers[tabId];
 	}
 
 	function setConnectorState(ctrl, isEnabled) {
@@ -432,6 +524,8 @@ define((require) => {
 		await updateVersionInStorage();
 		await notifyOfNotableChanges();
 		setupEventListeners();
+
+		currentTabId = (await Util.getCurrentTab()).id;
 
 		// track background page loaded - happens once per browser session
 		GA.pageview(`/background-loaded?version=${extVersion}`);
